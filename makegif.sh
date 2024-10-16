@@ -1,4 +1,5 @@
 #!/bin/bash
+# Script Created by DissidentCode github.carry327@passinbox.com
 
 # Function to clean up temporary files
 cleanup() {
