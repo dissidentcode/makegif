@@ -14,6 +14,70 @@ cleanup() {
 # Set up cleanup trap globally
 trap cleanup EXIT INT TERM
 
+# Check if gum is installed and offer to install it
+# Returns:
+#   0 if gum is installed or successfully installed
+#   1 if user declines installation or installation fails
+check_and_install_gum() {
+	if command -v gum &>/dev/null; then
+		return 0
+	fi
+
+	echo "🎨 Enhanced TUI mode requires 'gum' (a lightweight, beautiful TUI tool)"
+	echo ""
+	read -r -p "Would you like to install gum? (yes/no): " install_gum
+
+	if [ "$install_gum" != "yes" ]; then
+		echo "Falling back to standard interactive mode..."
+		return 1
+	fi
+
+	echo "Installing gum..."
+
+	# Detect OS and install accordingly
+	if [[ "$OSTYPE" == "darwin"* ]]; then
+		if command -v brew &>/dev/null; then
+			brew install gum
+		else
+			echo "Error: Homebrew not found. Please install Homebrew first." >&2
+			return 1
+		fi
+	elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+		# Try to detect package manager
+		if command -v apt-get &>/dev/null; then
+			sudo mkdir -p /etc/apt/keyrings
+			curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg
+			echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | sudo tee /etc/apt/sources.list.d/charm.list
+			sudo apt-get update && sudo apt-get install -y gum
+		elif command -v dnf &>/dev/null; then
+			echo '[charm]
+name=Charm
+baseurl=https://repo.charm.sh/yum/
+enabled=1
+gpgcheck=1
+gpgkey=https://repo.charm.sh/yum/gpg.key' | sudo tee /etc/yum.repos.d/charm.repo
+			sudo dnf install -y gum
+		else
+			echo "Error: Unsupported package manager. Please install gum manually:" >&2
+			echo "  https://github.com/charmbracelet/gum#installation" >&2
+			return 1
+		fi
+	else
+		echo "Error: Unsupported OS. Please install gum manually:" >&2
+		echo "  https://github.com/charmbracelet/gum#installation" >&2
+		return 1
+	fi
+
+	# Verify installation
+	if command -v gum &>/dev/null; then
+		echo "✅ Successfully installed gum!"
+		return 0
+	else
+		echo "Error: gum installation failed." >&2
+		return 1
+	fi
+}
+
 # Check if required dependencies (ffmpeg and gifsicle) are installed
 # Provides platform-specific installation instructions if dependencies are missing
 # Returns:
@@ -119,8 +183,8 @@ validate_input_file() {
 		return 1
 	fi
 
-	# Validate file type using ffprobe
-	if ! ffprobe -v error -i "$file" -t 0.1 -f null - >/dev/null 2>&1; then
+	# Validate file type using ffprobe - check if it has a video stream
+	if ! ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$file" 2>/dev/null | grep -q "video"; then
 		echo "Error: '$file' does not appear to be a valid video file." >&2
 		return 1
 	fi
@@ -289,99 +353,1072 @@ create_gif() {
 
 	# Then apply scaling (square or width-based)
 	if [ "$square_aspect" = "yes" ]; then
-		local square_size="min(iw,ih)"
-		filters="$filters,scale=${square_size}:${square_size}"
+		# Scale to fill square (increase ensures smaller dimension matches target), then center crop
+		filters="$filters,scale=${width}:${width}:force_original_aspect_ratio=increase,crop=${width}:${width}"
 	else
 		filters="$filters,scale=${width}:-1"
 	fi
 
-	# Create unique temp files
-	local temp_gif=$(mktemp "${TMPDIR:-/tmp}/makegif_XXXXXX.gif")
-	local palette=$(mktemp "${TMPDIR:-/tmp}/makegif_palette_XXXXXX.png")
-	TEMP_FILES+=("$temp_gif" "$palette")
+	# Create unique temp files (add to cleanup array immediately)
+	# Note: mktemp on macOS requires XXXXXX at end, so we append extension after
+	local temp_gif="$(mktemp "${TMPDIR:-/tmp}/makegif_gif_XXXXXX").gif"
+	TEMP_FILES+=("$temp_gif")  # Add immediately to minimize cleanup race condition
 
-	echo "Creating GIF (this may take a few minutes)..."
-	echo "  Source: $source_video"
-	echo "  Segment: $start_time + $duration"
-	echo "  Dimensions: ${width}px width"
-	echo "  Quality: $quality"
-	echo "  Filters: $filters"
-	echo ""
+	local palette="$(mktemp "${TMPDIR:-/tmp}/makegif_palette_XXXXXX").png"
+	TEMP_FILES+=("$palette")   # Add immediately to minimize cleanup race condition
+
+	local use_gum=false
+	command -v gum &>/dev/null && use_gum=true
+
+	if [ "$use_gum" = true ]; then
+		gum style --foreground 33 --bold "Creating your GIF..."
+		gum style --foreground 242 "  Source: $source_video"
+		gum style --foreground 242 "  Segment: $start_time + $duration"
+		gum style --foreground 242 "  Dimensions: ${width}px width"
+		gum style --foreground 242 "  Quality: $quality"
+		echo ""
+	else
+		echo "Creating GIF (this may take a few minutes)..."
+		echo "  Source: $source_video"
+		echo "  Segment: $start_time + $duration"
+		echo "  Dimensions: ${width}px width"
+		echo "  Quality: $quality"
+		echo "  Filters: $filters"
+		echo ""
+	fi
 
 	local ffmpeg_output
 	if [ "$quality" = "high" ]; then
-		echo "Step 1/2: Generating optimized color palette..."
-		ffmpeg_output=$(ffmpeg -v warning -stats -ss "$start_time" -t "$duration" -i "$source_video" \
-			-filter_complex "$filters,palettegen=stats_mode=full" -y "$palette" 2>&1)
-		local palette_exit=$?
+		if [ "$use_gum" = true ]; then
+			gum style --foreground 242 "  Generating color palette..."
+			ffmpeg -v warning -ss "$start_time" -t "$duration" -i "$source_video" \
+				-filter_complex "$filters,palettegen=stats_mode=full" -y "$palette" >/dev/null 2>&1
+			local palette_exit=$?
+		else
+			echo "Step 1/2: Generating optimized color palette..."
+			ffmpeg_output=$(ffmpeg -v warning -stats -ss "$start_time" -t "$duration" -i "$source_video" \
+				-filter_complex "$filters,palettegen=stats_mode=full" -y "$palette" 2>&1)
+			local palette_exit=$?
+		fi
 
 		if [ $palette_exit -ne 0 ]; then
-			echo "Error: Palette generation failed." >&2
-			echo "FFmpeg output:" >&2
-			echo "$ffmpeg_output" >&2
+			if [ "$use_gum" = true ]; then
+				gum style --foreground 196 "Palette generation failed. Check your input file."
+			else
+				echo "Error: Palette generation failed." >&2
+				echo "FFmpeg output:" >&2
+				echo "$ffmpeg_output" >&2
+			fi
 			return 1
 		fi
 
-		echo "Step 2/2: Creating GIF with palette..."
-		ffmpeg_output=$(ffmpeg -v warning -stats -ss "$start_time" -t "$duration" -i "$source_video" -i "$palette" \
-			-filter_complex "$filters,paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle" \
-			-an "$temp_gif" 2>&1)
-		local gif_exit=$?
+		if [ "$use_gum" = true ]; then
+			gum style --foreground 242 "  Creating GIF with palette..."
+			ffmpeg -v warning -ss "$start_time" -t "$duration" -i "$source_video" -i "$palette" \
+				-filter_complex "$filters,paletteuse=dither=floyd_steinberg:diff_mode=rectangle" \
+				-an "$temp_gif" >/dev/null 2>&1
+			local gif_exit=$?
+		else
+			echo "Step 2/2: Creating GIF with palette..."
+			ffmpeg_output=$(ffmpeg -v warning -stats -ss "$start_time" -t "$duration" -i "$source_video" -i "$palette" \
+				-filter_complex "$filters,paletteuse=dither=floyd_steinberg:diff_mode=rectangle" \
+				-an "$temp_gif" 2>&1)
+			local gif_exit=$?
+		fi
 
 		if [ $gif_exit -ne 0 ]; then
-			echo "Error: GIF creation failed." >&2
-			echo "FFmpeg output:" >&2
-			echo "$ffmpeg_output" >&2
+			if [ "$use_gum" = true ]; then
+				gum style --foreground 196 "GIF creation failed. Check your input file and settings."
+			else
+				echo "Error: GIF creation failed." >&2
+				echo "FFmpeg output:" >&2
+				echo "$ffmpeg_output" >&2
+			fi
 			return 1
 		fi
 	else
-		echo "Creating GIF..."
-		ffmpeg_output=$(ffmpeg -v warning -stats -ss "$start_time" -t "$duration" -i "$source_video" \
-			-vf "$filters" -an "$temp_gif" 2>&1)
-		local gif_exit=$?
+		if [ "$use_gum" = true ]; then
+			gum style --foreground 242 "  Creating GIF..."
+			ffmpeg -v warning -ss "$start_time" -t "$duration" -i "$source_video" \
+				-vf "$filters" -an "$temp_gif" >/dev/null 2>&1
+			local gif_exit=$?
+		else
+			echo "Creating GIF..."
+			ffmpeg_output=$(ffmpeg -v warning -stats -ss "$start_time" -t "$duration" -i "$source_video" \
+				-vf "$filters" -an "$temp_gif" 2>&1)
+			local gif_exit=$?
+		fi
 
 		if [ $gif_exit -ne 0 ]; then
-			echo "Error: GIF creation failed." >&2
-			echo "FFmpeg output:" >&2
-			echo "$ffmpeg_output" >&2
+			if [ "$use_gum" = true ]; then
+				gum style --foreground 196 "GIF creation failed. Check your input file and settings."
+			else
+				echo "Error: GIF creation failed." >&2
+				echo "FFmpeg output:" >&2
+				echo "$ffmpeg_output" >&2
+			fi
 			return 1
 		fi
 	fi
 
 	# Verify temp GIF was created
 	if [ ! -f "$temp_gif" ]; then
-		echo "Error: Temporary GIF was not created." >&2
+		if [ "$use_gum" = true ]; then
+			gum style --foreground 196 "Temporary GIF was not created."
+		else
+			echo "Error: Temporary GIF was not created." >&2
+		fi
 		return 1
 	fi
 
 	local temp_size=$(du -h "$temp_gif" | cut -f1)
-	echo ""
-	echo "Optimizing GIF (this may take a minute)..."
-	echo "  Unoptimized size: $temp_size"
-	echo "  Target colors: $num_colors"
 
-	if ! gifsicle -O3 --colors "$num_colors" "$temp_gif" -o "$output_gif" 2>&1; then
-		echo "Error: GIF optimization failed." >&2
-		echo "Temporary GIF preserved at: $temp_gif" >&2
+	if [ "$use_gum" = true ]; then
+		echo ""
+		gum style --foreground 242 "  Optimizing GIF..."
+		gifsicle -O3 --colors "$num_colors" "$temp_gif" -o "$output_gif" >/dev/null 2>&1
+		local gifsicle_exit=$?
+	else
+		echo ""
+		echo "Optimizing GIF (this may take a minute)..."
+		echo "  Unoptimized size: $temp_size"
+		echo "  Target colors: $num_colors"
+		local gifsicle_output=$(gifsicle -O3 --colors "$num_colors" "$temp_gif" -o "$output_gif" 2>&1)
+		local gifsicle_exit=$?
+	fi
+
+	if [ $gifsicle_exit -ne 0 ]; then
+		if [ "$use_gum" = true ]; then
+			gum style --foreground 196 "GIF optimization failed."
+		else
+			echo "Error: GIF optimization failed." >&2
+		fi
 		return 1
 	fi
 
 	if [ ! -f "$output_gif" ]; then
-		echo "Error: Output GIF was not created." >&2
+		if [ "$use_gum" = true ]; then
+			gum style --foreground 196 "Output GIF was not created."
+		else
+			echo "Error: Output GIF was not created." >&2
+		fi
 		return 1
 	fi
 
 	rm "$temp_gif"
 
 	local final_size=$(du -h "$output_gif" | cut -f1)
+
+	if [ "$use_gum" = true ]; then
+		echo ""
+		gum style \
+			--foreground 214 --border-foreground 214 --border rounded \
+			--align center --width 60 --margin "1 2" --padding "1 2" \
+			"Success! GIF created!" \
+			"" \
+			"File: $output_gif" \
+			"Size: $final_size (was $temp_size)"
+	else
+		echo ""
+		echo "Success! GIF created: $output_gif"
+		echo "  Final size: $final_size (was $temp_size)"
+	fi
+}
+
+# ============================================================================
+# TUI COLOR PALETTE
+# ============================================================================
+readonly COLOR_HEADER=212        # Magenta for headers
+readonly COLOR_HEADER_ALT=51     # Cyan for accents
+readonly COLOR_STEP=51           # Bright cyan for steps
+readonly COLOR_TEXT=15           # White for text
+readonly COLOR_HINT=242          # Dim gray for hints
+readonly COLOR_SUCCESS=46        # Bright green for success
+readonly COLOR_ERROR=196         # Bright red for errors
+readonly COLOR_SELECTION=226     # Yellow for selections
+
+# Validate color constants
+validate_colors() {
+	# Directly validate each color constant (more portable than indirection)
+	[[ "$COLOR_HEADER" =~ ^[0-9]+$ ]] || { echo "Error: Invalid COLOR_HEADER" >&2; return 1; }
+	[[ "$COLOR_HEADER_ALT" =~ ^[0-9]+$ ]] || { echo "Error: Invalid COLOR_HEADER_ALT" >&2; return 1; }
+	[[ "$COLOR_STEP" =~ ^[0-9]+$ ]] || { echo "Error: Invalid COLOR_STEP" >&2; return 1; }
+	[[ "$COLOR_TEXT" =~ ^[0-9]+$ ]] || { echo "Error: Invalid COLOR_TEXT" >&2; return 1; }
+	[[ "$COLOR_HINT" =~ ^[0-9]+$ ]] || { echo "Error: Invalid COLOR_HINT" >&2; return 1; }
+	[[ "$COLOR_SUCCESS" =~ ^[0-9]+$ ]] || { echo "Error: Invalid COLOR_SUCCESS" >&2; return 1; }
+	[[ "$COLOR_ERROR" =~ ^[0-9]+$ ]] || { echo "Error: Invalid COLOR_ERROR" >&2; return 1; }
+	[[ "$COLOR_SELECTION" =~ ^[0-9]+$ ]] || { echo "Error: Invalid COLOR_SELECTION" >&2; return 1; }
+	return 0
+}
+
+# ============================================================================
+# TUI HELPER FUNCTIONS
+# ============================================================================
+
+# Draw simple header
+tui_draw_header() {
 	echo ""
-	echo "Success! GIF created: $output_gif"
-	echo "  Final size: $final_size (was $temp_size)"
+	gum style --foreground $COLOR_HEADER --bold --align center \
+		'█▀▄▀█ ▄▀█ █▄▀ █▀▀ █▀▀ █ █▀▀' \
+		'█ ▀ █ █▀█ █ █ ██▄ █▄█ █ █▀'
+	echo ""
+}
+
+# Clear screen and redraw header
+tui_clear_and_header() {
+	clear
+	tui_draw_header
+	echo ""
+}
+
+# Draw progress bar showing current step
+tui_progress() {
+	local current=$1
+	local total=$2
+	local filled=$((current * 20 / total))
+	local empty=$((20 - filled))
+	local bar=$(printf '█%.0s' $(seq 1 $filled))$(printf '░%.0s' $(seq 1 $empty))
+	gum style --foreground $COLOR_HEADER "$bar  Step $current of $total"
+	echo ""
+}
+
+# Show step with prominent styling
+tui_show_step() {
+	local title=$1
+	local hint=$2
+	gum style --foreground $COLOR_STEP --bold "$title"
+	[ -n "$hint" ] && gum style --foreground $COLOR_HINT "   $hint"
+}
+
+# Show success message
+tui_success() {
+	gum style --foreground $COLOR_SUCCESS "✓ $1"
+}
+
+# Show error message
+tui_error() {
+	gum style --foreground $COLOR_ERROR "✗ $1"
+}
+
+# Validate time format (returns 0 if valid)
+tui_validate_time() {
+	local time=$1
+	[[ "$time" =~ ^[0-9]+(\.[0-9]+)?$ ]] && return 0
+	[[ "$time" =~ ^[0-9]{1,2}:[0-9]{2}$ ]] && return 0
+	[[ "$time" =~ ^[0-9]{1,2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?$ ]] && return 0
+	return 1
+}
+
+# Convert time string to seconds
+convert_time_to_seconds() {
+	local time=$1
+	if [[ "$time" =~ ^[0-9]+$ ]]; then
+		echo "$time"
+	elif [[ "$time" =~ ^([0-9]+):([0-9]+)$ ]]; then
+		echo $(( ${BASH_REMATCH[1]} * 60 + ${BASH_REMATCH[2]} ))
+	elif [[ "$time" =~ ^([0-9]+):([0-9]+):([0-9]+)$ ]]; then
+		echo $(( ${BASH_REMATCH[1]} * 3600 + ${BASH_REMATCH[2]} * 60 + ${BASH_REMATCH[3]} ))
+	else
+		echo "5"  # fallback
+	fi
+}
+
+# Get video duration in seconds
+get_video_duration() {
+	ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null | cut -d. -f1
+}
+
+# Select video file using gum filter
+select_video_file_tui() {
+	gum style --foreground $COLOR_HINT "Searching for video files..." >&2
+	echo "" >&2
+
+	local videos=""
+
+	# Only search current directory if it's not huge (avoid slowness)
+	local pwd_file_count=$(find . -maxdepth 1 -type f 2>/dev/null | wc -l)
+	if [ "$pwd_file_count" -lt 1000 ]; then
+		# Safe to search current directory (with timeout and reduced depth)
+		videos=$(timeout 3 find . -maxdepth 2 -type f \( \
+			-name "*.mp4" -o -name "*.mov" -o -name "*.avi" -o \
+			-name "*.mkv" -o -name "*.webm" -o -name "*.m4v" -o -name "*.flv" \) \
+			2>/dev/null | head -n 50)
+	fi
+
+	# Search common directories (with timeout)
+	local common_videos=$(timeout 5 find "$HOME/Movies" "$HOME/Downloads" "$HOME/Desktop" \
+		-maxdepth 3 -type f \( \
+		-name "*.mp4" -o -name "*.mov" -o -name "*.avi" -o \
+		-name "*.mkv" -o -name "*.webm" -o -name "*.m4v" -o -name "*.flv" \) \
+		2>/dev/null | head -n 150)
+
+	# Combine results (remove duplicates, limit to 200)
+	if [ -n "$videos" ] && [ -n "$common_videos" ]; then
+		videos=$(printf "%s\n%s" "$videos" "$common_videos" | sort -u | head -n 200)
+	elif [ -n "$common_videos" ]; then
+		videos="$common_videos"
+	fi
+
+	if [ -z "$videos" ]; then
+		# No videos found - ask user to enter path manually
+		gum style --foreground $COLOR_HINT "No videos found in common directories" >&2
+		echo "" >&2
+		gum style --foreground $COLOR_TEXT "Enter the full path to your video file:" >&2
+		gum input --placeholder "/path/to/video.mp4"
+	else
+		# Show filtered list with browse and manual entry options
+		local count=$(echo "$videos" | wc -l | tr -d ' ')
+		gum style --foreground $COLOR_SUCCESS "Found $count video files" >&2
+		echo "" >&2
+
+		# Add special options to the list
+		local options=$(printf "📁 Browse files...\n✏️  Enter path manually...\n%s" "$videos")
+		local selection=$(echo "$options" | gum filter --height 12 --placeholder "Type to search..." --prompt "Select: " --indicator "➤ " --indicator.foreground $COLOR_SELECTION)
+
+		# Check which option was selected
+		if [[ "$selection" == "📁 Browse files..." ]]; then
+			tui_clear_and_header >&2
+			tui_progress 1 10 >&2
+			tui_show_step "Browse for video file" >&2
+			echo "" >&2
+			gum file --height 15 --cursor "➤ " --cursor.foreground $COLOR_SELECTION
+		elif [[ "$selection" == "✏️  Enter path manually..." ]]; then
+			tui_clear_and_header >&2
+			tui_progress 1 10 >&2
+			tui_show_step "Enter video file path" >&2
+			echo "" >&2
+			gum input --placeholder "/path/to/video.mp4" --width 80
+		else
+			echo "$selection"
+		fi
+	fi
+}
+
+# TUI interactive mode using gum
+# Provides a beautiful, colorful interface for creating GIFs
+# Returns:
+#   0 on success
+#   1 on failure or cancellation
+# Step 1: Select source video
+step_1_select_video() {
+	local total_steps=10
+
+	while true; do
+		tui_clear_and_header
+		tui_progress 1 $total_steps
+		tui_show_step "Select your video file" "Use arrow keys or type to search"
+		echo ""
+
+		source_video=$(select_video_file_tui)
+		local gum_exit=$?
+
+		# Handle cancel
+		if [ $gum_exit -ne 0 ] || [ -z "$source_video" ]; then
+			local choice=$(gum choose "🔙 Exit" "🔁 Try again" --height 3 --header "What would you like to do?")
+			case "$choice" in
+				"🔙 Exit")
+					if gum confirm "Are you sure you want to exit?"; then
+						STEP_ACTION="exit"
+						return
+					fi
+					continue ;;
+				"🔁 Try again") continue ;;
+				*) continue ;;
+			esac
+		fi
+
+		# Trim whitespace and quotes from user input
+		source_video=$(echo "$source_video" | xargs | tr -d "'\"")
+
+		# Validate - capture stderr to show user if it fails
+		local validation_result
+		validation_result=$(validate_input_file "$source_video" 2>&1)
+		local validation_exit=$?
+
+		if [ $validation_exit -eq 0 ]; then
+			source_video="$validation_result"
+			tui_clear_and_header
+			tui_progress 1 $total_steps
+			tui_show_step "Select your video file"
+			echo ""
+			tui_success "Selected: $(basename "$source_video")"
+
+			# Show video info
+			vid_duration=$(get_video_duration "$source_video")
+			[ -n "$vid_duration" ] && gum style --foreground $COLOR_HINT "   Duration: ${vid_duration}s"
+
+			sleep 0.8
+			STEP_ACTION="next"
+			return
+		else
+			# Strip ANSI codes from validation error
+			local clean_error=$(echo "$validation_result" | sed 's/\x1b\[[0-9;]*[mGKH]//g')
+
+			tui_error "Not a valid video file"
+			echo ""
+			# Display error without gum style to avoid ANSI conflicts
+			if [ -n "$clean_error" ]; then
+				echo "$clean_error"  # Show full error
+			fi
+			echo ""
+			gum style --foreground $COLOR_HINT "Please select an MP4, MOV, MKV, or other video file"
+			echo ""
+			gum style --foreground $COLOR_SELECTION "Press Enter to continue..."
+			read -r
+		fi
+	done
+}
+
+# Step 2: Start time
+step_2_start_time() {
+	local total_steps=10
+
+	while true; do
+		tui_clear_and_header
+		tui_progress 2 $total_steps
+		tui_show_step "Enter start time" "Format: seconds (10), MM:SS (1:30), or HH:MM:SS (01:30:45)"
+		echo ""
+
+		start_time=$(gum input --placeholder "0" --prompt "Start time: " --width 30)
+		local gum_exit=$?
+
+		# Check for cancel (escape key)
+		if [ $gum_exit -ne 0 ]; then
+			local choice=$(gum choose "⬅️  Go back" "🔙 Exit" "🔁 Try again" --height 4 --header "What would you like to do?")
+			case "$choice" in
+				"⬅️  Go back") STEP_ACTION="back"; return ;;
+				"🔙 Exit")
+					if gum confirm "Are you sure you want to exit?"; then
+						STEP_ACTION="exit"
+						return
+					fi
+					continue ;;
+				"🔁 Try again") continue ;;
+				*) continue ;;
+			esac
+		fi
+
+		# Process input and validate
+		start_time=$(echo "$start_time" | xargs)
+		if [ -z "$start_time" ]; then
+			start_time="0"
+		fi
+
+		if tui_validate_time "$start_time"; then
+			start_sec=$(convert_time_to_seconds "$start_time")
+			if [ -n "$vid_duration" ] && [ "$start_sec" -ge "$vid_duration" ]; then
+				tui_error "Start time (${start_sec}s) exceeds video duration (${vid_duration}s)"
+				sleep 1.5
+				continue
+			fi
+
+			tui_success "Start time: $start_time"
+			sleep 0.5
+			STEP_ACTION="next"
+			return
+		else
+			tui_error "Invalid time format"
+			gum style --foreground $COLOR_HINT "Examples: 0, 10, 1:30, 0:01:30"
+			sleep 1.5
+			continue
+		fi
+	done
+}
+
+# Step 3: Duration
+step_3_duration() {
+	local total_steps=10
+
+	while true; do
+		tui_clear_and_header
+		tui_progress 3 $total_steps
+		tui_show_step "Enter duration" "Tip: Keep under 10 seconds for reasonable file sizes"
+		echo ""
+
+		duration=$(gum input --placeholder "5" --prompt "Duration: " --width 30)
+		local gum_exit=$?
+
+		# Check for cancel (escape key)
+		if [ $gum_exit -ne 0 ]; then
+			local choice=$(gum choose "⬅️  Go back" "🔙 Exit" "🔁 Try again" --height 4 --header "What would you like to do?")
+			case "$choice" in
+				"⬅️  Go back") STEP_ACTION="back"; return ;;
+				"🔙 Exit")
+					if gum confirm "Are you sure you want to exit?"; then
+						STEP_ACTION="exit"
+						return
+					fi
+					continue ;;
+				"🔁 Try again") continue ;;
+				*) continue ;;
+			esac
+		fi
+
+		# Process input and validate
+		duration=$(echo "$duration" | xargs)
+		if [ -z "$duration" ]; then
+			duration="5"
+		fi
+
+		if tui_validate_time "$duration"; then
+			duration_sec=$(convert_time_to_seconds "$duration")
+
+			if [ "$duration_sec" -le 0 ]; then
+				tui_error "Duration must be greater than 0"
+				sleep 1.5
+				continue
+			fi
+
+			# Check against video duration if available
+			if [ -n "$vid_duration" ] && [ -n "$start_sec" ]; then
+				local remaining=$((vid_duration - start_sec))
+				if [ "$duration_sec" -gt "$remaining" ]; then
+					tui_error "Duration (${duration_sec}s) exceeds remaining video (${remaining}s)"
+					gum style --foreground $COLOR_HINT "Max duration from start point: ${remaining}s"
+					sleep 2
+					continue
+				fi
+			fi
+
+			tui_success "Duration: $duration"
+			sleep 0.5
+			STEP_ACTION="next"
+			return
+		else
+			tui_error "Invalid time format"
+			gum style --foreground $COLOR_HINT "Examples: 5, 10.5, 1:30, 0:05:00"
+			sleep 1.5
+			continue
+		fi
+	done
+}
+
+# Step 4: Output filename
+step_4_output_filename() {
+	local total_steps=10
+
+	while true; do
+		tui_clear_and_header
+		tui_progress 4 $total_steps
+		tui_show_step "Choose output location"
+		echo ""
+
+		# Offer common directories
+		local current_dir_display=$(pwd | sed "s|$HOME|~|")
+		local dir_choice=$(gum choose \
+			"📂 Current directory ($current_dir_display)" \
+			"🖥️  Desktop" \
+			"📥 Downloads" \
+			"✏️  Enter custom path..." \
+			--height 6 --header "Where to save the GIF?" --cursor "➤ " --cursor.foreground $COLOR_SELECTION)
+
+		local gum_exit=$?
+		if [ $gum_exit -ne 0 ]; then
+			# Handle escape/back
+			local choice=$(gum choose "⬅️  Go back" "🔙 Exit" "🔁 Try again" --height 4 --header "What would you like to do?")
+			case "$choice" in
+				"⬅️  Go back") STEP_ACTION="back"; return ;;
+				"🔙 Exit")
+					if gum confirm "Are you sure you want to exit?"; then
+						STEP_ACTION="exit"
+						return
+					fi
+					continue ;;
+				*) continue ;;
+			esac
+		fi
+
+		# Set output directory based on choice
+		local output_dir
+		case "$dir_choice" in
+			*"Current directory"*) output_dir="$(pwd)" ;;
+			*"Desktop"*) output_dir="$HOME/Desktop" ;;
+			*"Downloads"*) output_dir="$HOME/Downloads" ;;
+			*"Enter custom"*)
+				tui_clear_and_header
+				tui_progress 4 $total_steps
+				tui_show_step "Enter output directory"
+				echo ""
+				output_dir=$(gum input --placeholder "$HOME/Movies" --prompt "Directory: " --width 60)
+				output_dir=$(echo "$output_dir" | xargs)
+				# Expand tilde
+				output_dir="${output_dir/#\~/$HOME}"
+				;;
+		esac
+
+		# Validate directory exists
+		if [ ! -d "$output_dir" ]; then
+			tui_error "Directory does not exist: $output_dir"
+			sleep 1.5
+			continue
+		fi
+
+		if [ ! -w "$output_dir" ]; then
+			tui_error "Cannot write to directory: $output_dir"
+			sleep 1.5
+			continue
+		fi
+
+		# Now ask for filename
+		tui_clear_and_header
+		tui_progress 4 $total_steps
+		local dir_display=$(echo "$output_dir" | sed "s|$HOME|~|")
+		tui_show_step "Enter filename" "Will be saved to: $dir_display"
+		echo ""
+
+		local filename=$(gum input --placeholder "output.gif" --prompt "Filename: " --width 40)
+		local input_exit=$?
+
+		# Check for cancel on filename input
+		if [ $input_exit -ne 0 ]; then
+			continue  # Go back to directory selection
+		fi
+
+		filename=$(echo "$filename" | xargs)
+
+		if [ -z "$filename" ]; then
+			filename="output.gif"
+		fi
+
+		# Auto-add .gif extension
+		[[ "$filename" != *.gif ]] && filename="${filename}.gif"
+
+		# Combine path
+		output_gif="$output_dir/$filename"
+
+		# Check if file exists
+		if [ -f "$output_gif" ]; then
+			if ! gum confirm "File exists. Overwrite $output_gif?"; then
+				continue
+			fi
+		fi
+
+		tui_success "Output: $output_gif"
+		sleep 0.5
+		STEP_ACTION="next"
+		return
+	done
+}
+
+# Step 5: Quality
+step_5_quality() {
+	local total_steps=10
+
+	while true; do
+		tui_clear_and_header
+		tui_progress 5 $total_steps
+		tui_show_step "Select quality" "High = better colors but slower"
+		echo ""
+
+		quality=$(gum choose --height 5 --cursor "➤ " --cursor.foreground $COLOR_SELECTION --selected.foreground $COLOR_SELECTION "high" "low")
+		local gum_exit=$?
+
+		# Check for cancel (escape key)
+		if [ $gum_exit -ne 0 ] || [ -z "$quality" ]; then
+			local choice=$(gum choose "⬅️  Go back" "🔙 Exit" "🔁 Try again" --height 4 --header "What would you like to do?")
+			case "$choice" in
+				"⬅️  Go back") STEP_ACTION="back"; return ;;
+				"🔙 Exit")
+					if gum confirm "Are you sure you want to exit?"; then
+						STEP_ACTION="exit"
+						return
+					fi
+					continue ;;
+				"🔁 Try again") continue ;;
+				*) continue ;;
+			esac
+		fi
+
+		tui_success "Quality: $quality"
+		sleep 0.5
+		STEP_ACTION="next"
+		return
+	done
+}
+
+# Step 6: Width
+step_6_width() {
+	local total_steps=10
+
+	while true; do
+		tui_clear_and_header
+		tui_progress 6 $total_steps
+		tui_show_step "Select width" "Smaller = smaller file size"
+		echo ""
+
+		width=$(gum choose --height 8 --cursor "➤ " --cursor.foreground $COLOR_SELECTION --selected.foreground $COLOR_SELECTION "480" "640" "800" "1024" "1280" "Custom...")
+		local gum_exit=$?
+
+		# Check for cancel (escape key)
+		if [ $gum_exit -ne 0 ] || [ -z "$width" ]; then
+			local choice=$(gum choose "⬅️  Go back" "🔙 Exit" "🔁 Try again" --height 4 --header "What would you like to do?")
+			case "$choice" in
+				"⬅️  Go back") STEP_ACTION="back"; return ;;
+				"🔙 Exit")
+					if gum confirm "Are you sure you want to exit?"; then
+						STEP_ACTION="exit"
+						return
+					fi
+					continue ;;
+				"🔁 Try again") continue ;;
+				*) continue ;;
+			esac
+		fi
+
+		if [ "$width" = "Custom..." ]; then
+			width=$(gum input --placeholder "640" --prompt "Custom width: " --width 20)
+			local custom_exit=$?
+
+			# Check for cancel
+			if [ $custom_exit -ne 0 ]; then
+				continue
+			fi
+
+			# Trim whitespace
+			width=$(echo "$width" | xargs)
+
+			# Apply default if empty
+			if [ -z "$width" ]; then
+				width="640"
+			fi
+		fi
+
+		if validate_numeric_param "$width" "width" 32 7680 2>/dev/null; then
+			tui_success "Width: ${width}px"
+			sleep 0.5
+			STEP_ACTION="next"
+			return
+		fi
+		tui_error "Width must be 32-7680"
+		sleep 1
+	done
+}
+
+# Step 7: FPS
+step_7_fps() {
+	local total_steps=10
+
+	while true; do
+		tui_clear_and_header
+		tui_progress 7 $total_steps
+		tui_show_step "Select frame rate (FPS)" "Higher = smoother but larger file"
+		echo ""
+
+		fps=$(gum choose --height 8 --cursor "➤ " --cursor.foreground $COLOR_SELECTION --selected.foreground $COLOR_SELECTION "10" "15" "20" "24" "30" "Custom...")
+		local gum_exit=$?
+
+		# Check for cancel (escape key)
+		if [ $gum_exit -ne 0 ] || [ -z "$fps" ]; then
+			local choice=$(gum choose "⬅️  Go back" "🔙 Exit" "🔁 Try again" --height 4 --header "What would you like to do?")
+			case "$choice" in
+				"⬅️  Go back") STEP_ACTION="back"; return ;;
+				"🔙 Exit")
+					if gum confirm "Are you sure you want to exit?"; then
+						STEP_ACTION="exit"
+						return
+					fi
+					continue ;;
+				"🔁 Try again") continue ;;
+				*) continue ;;
+			esac
+		fi
+
+		if [ "$fps" = "Custom..." ]; then
+			fps=$(gum input --placeholder "15" --prompt "Custom FPS: " --width 20)
+			local custom_exit=$?
+
+			# Check for cancel
+			if [ $custom_exit -ne 0 ]; then
+				continue
+			fi
+
+			# Trim whitespace
+			fps=$(echo "$fps" | xargs)
+
+			# Apply default if empty
+			if [ -z "$fps" ]; then
+				fps="15"
+			fi
+		fi
+
+		if validate_numeric_param "$fps" "fps" 1 60 2>/dev/null; then
+			# Warn about high FPS causing large files
+			if [ "$fps" -gt 15 ]; then
+				echo ""
+				gum style --foreground $COLOR_ERROR --bold "⚠️  High FPS Warning"
+				gum style --foreground $COLOR_HINT "FPS of $fps will create large files (many frames)."
+				gum style --foreground $COLOR_HINT "Recommended: 10-15 FPS for reasonable file sizes."
+				echo ""
+				if ! gum confirm "Continue with $fps FPS?"; then
+					continue  # Go back to FPS selection
+				fi
+			fi
+
+			tui_success "FPS: $fps"
+			sleep 0.5
+			STEP_ACTION="next"
+			return
+		fi
+		tui_error "FPS must be 1-60"
+		sleep 1
+	done
+}
+
+# Step 8: Colors
+step_8_colors() {
+	local total_steps=10
+
+	while true; do
+		tui_clear_and_header
+		tui_progress 8 $total_steps
+		tui_show_step "Select color depth" "Fewer colors = smaller file. 64-128 often looks great!"
+		echo ""
+
+		num_colors=$(gum choose --height 6 --cursor "➤ " --cursor.foreground $COLOR_SELECTION --selected.foreground $COLOR_SELECTION "64" "128" "256" "Custom...")
+		local gum_exit=$?
+
+		# Check for cancel (escape key)
+		if [ $gum_exit -ne 0 ] || [ -z "$num_colors" ]; then
+			local choice=$(gum choose "⬅️  Go back" "🔙 Exit" "🔁 Try again" --height 4 --header "What would you like to do?")
+			case "$choice" in
+				"⬅️  Go back") STEP_ACTION="back"; return ;;
+				"🔙 Exit")
+					if gum confirm "Are you sure you want to exit?"; then
+						STEP_ACTION="exit"
+						return
+					fi
+					continue ;;
+				"🔁 Try again") continue ;;
+				*) continue ;;
+			esac
+		fi
+
+		if [ "$num_colors" = "Custom..." ]; then
+			num_colors=$(gum input --placeholder "128" --prompt "Custom colors (2-256): " --width 20)
+			local custom_exit=$?
+
+			# Check for cancel
+			if [ $custom_exit -ne 0 ]; then
+				continue
+			fi
+
+			# Trim whitespace
+			num_colors=$(echo "$num_colors" | xargs)
+
+			# Apply default if empty
+			if [ -z "$num_colors" ]; then
+				num_colors="128"
+			fi
+		fi
+
+		if validate_numeric_param "$num_colors" "colors" 2 256 2>/dev/null; then
+			tui_success "Colors: $num_colors"
+			sleep 0.5
+			STEP_ACTION="next"
+			return
+		fi
+		tui_error "Colors must be 2-256"
+		sleep 1
+	done
+}
+
+# Step 9: Remove black bars
+step_9_remove_black_bars() {
+	local total_steps=10
+
+	while true; do
+		tui_clear_and_header
+		tui_progress 9 $total_steps
+		tui_show_step "Remove black bars?" "Automatically detect and crop letterbox bars"
+		echo ""
+
+		if gum confirm --default=false "Remove black bars?"; then
+			remove_black_bars="yes"
+			tui_success "Will remove black bars"
+		else
+			local confirm_exit=$?
+
+			# Check for cancel (escape key) - exit code 130, not 1 which means "No"
+			if [ $confirm_exit -gt 1 ]; then
+				local choice=$(gum choose "⬅️  Go back" "🔙 Exit" "🔁 Try again" --height 4 --header "What would you like to do?")
+				case "$choice" in
+					"⬅️  Go back") STEP_ACTION="back"; return ;;
+					"🔙 Exit")
+						if gum confirm "Are you sure you want to exit?"; then
+							STEP_ACTION="exit"
+							return
+						fi
+						continue ;;
+					"🔁 Try again") continue ;;
+					*) continue ;;
+				esac
+			fi
+
+			remove_black_bars="no"
+			tui_success "Keep original aspect ratio"
+		fi
+
+		sleep 0.5
+		STEP_ACTION="next"
+		return
+	done
+}
+
+# Step 10: Square aspect
+step_10_square_aspect() {
+	local total_steps=10
+
+	while true; do
+		tui_clear_and_header
+		tui_progress 10 $total_steps
+		tui_show_step "Make it square?" "Crop to square aspect ratio (good for social media)"
+		echo ""
+
+		if gum confirm --default=false "Make square?"; then
+			square_aspect="yes"
+			tui_success "Will make square"
+		else
+			local confirm_exit=$?
+
+			# Check for cancel (escape key) - exit code 130, not 1 which means "No"
+			if [ $confirm_exit -gt 1 ]; then
+				local choice=$(gum choose "⬅️  Go back" "🔙 Exit" "🔁 Try again" --height 4 --header "What would you like to do?")
+				case "$choice" in
+					"⬅️  Go back") STEP_ACTION="back"; return ;;
+					"🔙 Exit")
+						if gum confirm "Are you sure you want to exit?"; then
+							STEP_ACTION="exit"
+							return
+						fi
+						continue ;;
+					"🔁 Try again") continue ;;
+					*) continue ;;
+				esac
+			fi
+
+			square_aspect="no"
+			tui_success "Keep original proportions"
+		fi
+
+		sleep 0.5
+		STEP_ACTION="next"
+		return
+	done
+}
+
+makegif_tui() {
+	local total_steps=10
+
+	# Declare all variables that will be shared across steps
+	local source_video start_time duration output_gif quality
+	local width fps num_colors remove_black_bars square_aspect
+	local validation_result validation_exit vid_duration duration_sec start_sec
+
+	# Current step counter
+	local current_step=1
+	STEP_ACTION=""
+
+	# Main navigation loop
+	while true; do
+		STEP_ACTION=""
+
+		case $current_step in
+			1)
+				step_1_select_video
+				;;
+			2)
+				step_2_start_time
+				;;
+			3)
+				step_3_duration
+				;;
+			4)
+				step_4_output_filename
+				;;
+			5)
+				step_5_quality
+				;;
+			6)
+				step_6_width
+				;;
+			7)
+				step_7_fps
+				;;
+			8)
+				step_8_colors
+				;;
+			9)
+				step_9_remove_black_bars
+				;;
+			10)
+				step_10_square_aspect
+				;;
+			11)
+				# All steps complete - show summary and create GIF
+				tui_clear_and_header
+
+				gum style \
+					--foreground $COLOR_HEADER --border-foreground $COLOR_HEADER --border rounded \
+					--align left --width 55 --margin "0 2" --padding "1 2" \
+					"Configuration Summary" \
+					"" \
+					"Source:   $(basename "$source_video")" \
+					"Start:    $start_time" \
+					"Duration: $duration" \
+					"Output:   $output_gif" \
+					"" \
+					"Quality:  $quality" \
+					"Width:    ${width}px" \
+					"FPS:      $fps" \
+					"Colors:   $num_colors" \
+					"Crop:     $remove_black_bars" \
+					"Square:   $square_aspect"
+
+				echo ""
+				if ! gum confirm "Proceed with GIF creation?"; then
+					# Go back to step 10 to allow editing
+					current_step=10
+					continue
+				fi
+
+				echo ""
+				create_gif "$source_video" "$start_time" "$duration" "$output_gif" "$quality" "$width" "$fps" "$num_colors" "$remove_black_bars" "$square_aspect"
+				return 0
+				;;
+			*)
+				# Should never happen, but safeguard
+				tui_error "Invalid step: $current_step"
+				return 1
+				;;
+		esac
+
+		# Process navigation result
+		case "$STEP_ACTION" in
+			"next")
+				current_step=$((current_step + 1))
+				;;
+			"back")
+				if [ $current_step -gt 1 ]; then
+					current_step=$((current_step - 1))
+				fi
+				;;
+			"exit")
+				tui_error "Cancelled"
+				return 0
+				;;
+			*)
+				# Unexpected result
+				tui_error "Navigation error"
+				return 1
+				;;
+		esac
+	done
 }
 
 # Main entry point for makegif tool
-# Supports two modes:
-#   - Interactive mode (no arguments): Prompts user for all parameters
+# Supports three modes:
+#   - TUI mode (no arguments + gum available): Beautiful interactive interface
+#   - Standard interactive mode (no arguments, no gum): Text prompts
 #   - Argument mode (5+ arguments): Accepts parameters as command-line arguments
 # Usage (argument mode):
 #   makegif <source_video> <start_time> <duration> <output_gif> [quality] [width] [fps] [num_colors] [remove_black_bars] [square_aspect]
@@ -396,7 +1433,13 @@ makegif() {
 	fi
 
 	if [ $# -eq 0 ]; then
-		# Interactive Mode
+		# Try TUI mode first
+		if check_and_install_gum; then
+			makegif_tui
+			return $?
+		fi
+
+		# Fall back to standard Interactive Mode
 		echo "Enter the source video path:"
 		read -r source_video
 
