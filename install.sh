@@ -15,7 +15,7 @@ BOLD='\033[1m'
 NC='\033[0m' # No Color
 
 INSTALL_DIR="$HOME/.local/share/makegif"
-SCRIPT_URL="https://raw.githubusercontent.com/nathan-kennedy/makegif/main/makegif.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/dissidentcode/makegif/master/makegif.sh"
 
 print_banner() {
     echo -e "${BLUE}${BOLD}"

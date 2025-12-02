@@ -7,7 +7,7 @@ MakeGIF is a command-line tool that makes it easy to create high-quality GIFs fr
 ## Quick Install
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/nathan-kennedy/makegif/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/dissidentcode/makegif/master/install.sh | bash
 ```
 
 This will download MakeGIF, add it to your shell, and offer to install any missing dependencies.
